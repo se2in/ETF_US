@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import sys
+from io import BytesIO
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +23,9 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
+
+import pdfplumber
+import requests
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -214,9 +218,12 @@ def load_config(path: str | Path) -> dict[str, Any]:
             return value
         return str((base_dir / value).resolve())
 
-    for key in ("database_path", "output_dir"):
+    for key in ("database_path", "output_dir", "github_pages_dir"):
         if key in config:
             config[key] = resolve_local(config[key])
+    krx = config.get("krx")
+    if isinstance(krx, dict) and "raw_pdf_dir" in krx:
+        krx["raw_pdf_dir"] = resolve_local(krx["raw_pdf_dir"])
     return config
 
 
@@ -241,6 +248,16 @@ def append_query_params(url: str, params: dict[str, str]) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
+def format_template_value(value: Any, context: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return value.format(**context)
+    if isinstance(value, dict):
+        return {key: format_template_value(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [format_template_value(item, context) for item in value]
+    return value
+
+
 def fetch_dimensional_csv(ticker: str, user_agent: str) -> tuple[str, bytes]:
     today_us = datetime.now(US_ET).date()
     for offset in range(0, 10):
@@ -253,6 +270,186 @@ def fetch_dimensional_csv(ticker: str, user_agent: str) -> tuple[str, bytes]:
         if content.lstrip().lower().startswith(b"date,etf_ticker,"):
             return url, content
     raise ValueError(f"No recent Dimensional CSV found for {ticker}.")
+
+
+class KrxMarketDataClient:
+    def __init__(self, config: dict[str, Any], user_agent: str) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept": "application/pdf,application/octet-stream,text/html,application/json,*/*",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+        )
+        self._authenticated = False
+
+    def authenticate(self) -> None:
+        if self._authenticated:
+            return
+        cookie_env = str(self.config.get("cookie_env", "")).strip()
+        if cookie_env:
+            cookie_value = os.getenv(cookie_env, "").strip()
+            if cookie_value:
+                self.session.headers["Cookie"] = cookie_value
+                self._authenticated = True
+                return
+
+        login_post_url = str(self.config.get("login_post_url", "")).strip()
+        username_env = str(self.config.get("username_env", "KRX_MARKETDATA_ID")).strip()
+        password_env = str(self.config.get("password_env", "KRX_MARKETDATA_PASSWORD")).strip()
+        username = os.getenv(username_env, "").strip()
+        password = os.getenv(password_env, "").strip()
+
+        if not login_post_url:
+            self._authenticated = True
+            return
+        if not username or not password:
+            raise ValueError(
+                f"Missing KRX credentials. Set environment variables {username_env} and {password_env}."
+            )
+
+        login_page_url = str(self.config.get("login_page_url", "")).strip()
+        if login_page_url:
+            self.session.get(login_page_url, timeout=30)
+
+        payload = format_template_value(self.config.get("login_payload", {}), {})
+        payload[str(self.config.get("username_field", "loginId"))] = username
+        payload[str(self.config.get("password_field", "loginPwd"))] = password
+
+        headers = {}
+        if login_page_url:
+            headers["Referer"] = login_page_url
+
+        response = self.session.post(login_post_url, data=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        self._authenticated = True
+
+    def fetch_pdf(self, etf: dict[str, Any], trade_date: str | None) -> tuple[str, bytes]:
+        self.authenticate()
+        context = {
+            "ticker": etf["ticker"].upper(),
+            "date": (trade_date or today_kst()).replace("-", ""),
+            "date_dash": trade_date or today_kst(),
+        }
+        source_url = str(format_template_value(etf.get("source_url", ""), context)).strip()
+        if not source_url:
+            raise ValueError("KRX PDF source_url is not configured.")
+
+        method = str(etf.get("source_method", "GET")).upper()
+        payload = format_template_value(etf.get("source_payload", {}), context)
+        headers = {}
+        referer = str(format_template_value(etf.get("source_referer", self.config.get("source_referer", "")), context)).strip()
+        if referer:
+            headers["Referer"] = referer
+
+        if method == "POST":
+            response = self.session.post(source_url, data=payload, headers=headers, timeout=60)
+        else:
+            response = self.session.get(source_url, params=payload or None, headers=headers, timeout=60)
+        response.raise_for_status()
+        content = response.content
+        content_type = response.headers.get("content-type", "").lower()
+        if not content.lstrip().startswith(b"%PDF") and "pdf" not in content_type:
+            raise ValueError("KRX response is not a PDF. Check login/session and source_url settings.")
+        return response.url, content
+
+
+def normalize_krx_header(value: str) -> str:
+    return re.sub(r"[\s_\-/()%]+", "", clean_text(value)).lower()
+
+
+def canonical_krx_header(value: str) -> str | None:
+    text = normalize_krx_header(value)
+    if not text:
+        return None
+    aliases = {
+        "ticker": ["종목코드", "단축코드", "코드", "표준코드", "구성종목코드", "종목번호", "symbol", "ticker"],
+        "name": ["종목명", "한글종목명", "한글종목약명", "자산명", "구성종목명", "종목", "name", "securityname"],
+        "shares": ["수량", "보유수량", "주식수", "편입수량", "주수", "quantity", "shares"],
+        "market_value": ["평가금액", "평가금액원", "시가평가액", "평가액", "금액", "amount", "marketvalue", "value"],
+        "weight": ["비중", "편입비중", "구성비", "비율", "weight", "portfolioweight"],
+        "currency": ["통화", "currency"],
+    }
+    for canonical, candidates in aliases.items():
+        if text in {normalize_krx_header(item) for item in candidates}:
+            return canonical
+    return None
+
+
+def parse_krx_as_of_date(text: str, fallback: str | None) -> str:
+    patterns = [
+        r"기준일\s*[:：]?\s*([0-9]{4}[./-][0-9]{1,2}[./-][0-9]{1,2})",
+        r"작성기준일\s*[:：]?\s*([0-9]{4}[./-][0-9]{1,2}[./-][0-9]{1,2})",
+        r"기준일\s*[:：]?\s*([0-9]{4}년\s*[0-9]{1,2}월\s*[0-9]{1,2}일)",
+        r"작성기준일\s*[:：]?\s*([0-9]{4}년\s*[0-9]{1,2}월\s*[0-9]{1,2}일)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        raw = match.group(1)
+        raw = raw.replace("년", "-").replace("월", "-").replace("일", "").replace(".", "-").replace("/", "-")
+        try:
+            return datetime.strptime(re.sub(r"\s+", "", raw), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return fallback or today_kst()
+
+
+def extract_krx_pdf_rows(content: bytes, fallback_date: str | None) -> tuple[str, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    first_text = ""
+    with pdfplumber.open(BytesIO(content)) as pdf:
+        if pdf.pages:
+            first_text = pdf.pages[0].extract_text() or ""
+        for page in pdf.pages:
+            for table in page.extract_tables() or []:
+                if not table or len(table) < 2:
+                    continue
+                header_index = -1
+                headers: list[str | None] = []
+                for index, candidate in enumerate(table[:6]):
+                    mapped = [canonical_krx_header(cell or "") for cell in candidate]
+                    if "name" in mapped and ("weight" in mapped or "market_value" in mapped):
+                        header_index = index
+                        headers = mapped
+                        break
+                if header_index < 0:
+                    continue
+                for raw_row in table[header_index + 1 :]:
+                    if not raw_row:
+                        continue
+                    item: dict[str, Any] = {}
+                    for idx, header in enumerate(headers):
+                        if not header or idx >= len(raw_row):
+                            continue
+                        value = clean_text(raw_row[idx] or "")
+                        if value:
+                            item[header] = value
+                    if not item.get("name") or is_total_row(str(item["name"])):
+                        continue
+                    rows.append(item)
+    if not rows:
+        raise ValueError("KRX PDF table parsing failed. No holdings rows were detected.")
+    return parse_krx_as_of_date(first_text, fallback_date), rows
+
+
+def fetch_krx_pdf_holdings(etf: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, list[Holding]]:
+    krx = config.get("krx", {})
+    trade_date = str(etf.get("trade_date") or krx.get("trade_date") or today_kst())
+    client = KrxMarketDataClient(krx, config.get("user_agent", "US ETF Weight Monitor contact@example.com"))
+    source_url, content = client.fetch_pdf(etf, trade_date)
+    raw_dir = Path(str(krx.get("raw_pdf_dir", Path(config["database_path"]).parent / "krx_pdfs")))
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_name = f'{etf["ticker"].upper()}_{trade_date.replace("-", "")}.pdf'
+    (raw_dir / raw_name).write_bytes(content)
+    as_of_date, rows = extract_krx_pdf_rows(content, trade_date)
+    holdings = normalize_holdings(rows)
+    if not holdings:
+        raise ValueError("KRX PDF was downloaded but holdings normalization returned no rows.")
+    return source_url, as_of_date, holdings
 
 
 def detect_source_type(source_type: str, url: str, content: bytes) -> str:
@@ -723,7 +920,8 @@ def update_all(config: dict[str, Any]) -> dict[str, Any]:
     init_db(conn)
     run_id = start_run(conn)
     results = []
-    for etf in config.get("etfs", []):
+    tracked_etfs = list(config.get("etfs", [])) + list(config.get("kr_etfs", []))
+    for etf in tracked_etfs:
         if not etf.get("enabled", True):
             results.append({"ticker": etf["ticker"].upper(), "status": "SKIPPED", "row_count": 0, "message": "Source pending"})
             continue
@@ -732,7 +930,7 @@ def update_all(config: dict[str, Any]) -> dict[str, Any]:
     message = "; ".join(f"{item['ticker']}={item['status']}({item['row_count']})" for item in results)
     finish_run(conn, run_id, status, message)
     output_path = render_dashboard(conn, config)
-    summary = build_telegram_summary(conn, results, output_path, run_id, config.get("etfs", []))
+    summary = build_telegram_summary(conn, results, output_path, run_id, config)
     if config.get("telegram", {}).get("enabled"):
         send_telegram(config, summary, output_path)
     conn.close()
@@ -758,6 +956,23 @@ def update_one(conn: sqlite3.Connection, etf: dict[str, Any], config: dict[str, 
             source_url = append_query_params(source_url, {"apikey": api_key})
             content = fetch_bytes(source_url, user_agent)
             source_type = "json"
+        elif requested_source_type == "krx_marketdata_pdf":
+            source_url, as_of, holdings = fetch_krx_pdf_holdings({**etf, "ticker": ticker}, config)
+            raw_hash = hashlib.sha256(
+                json.dumps([holding.raw for holding in holdings], ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            snapshot_id = save_snapshot(
+                conn,
+                {**etf, "ticker": ticker, "source_url": source_url},
+                requested_source_type,
+                raw_hash,
+                as_of,
+                holdings,
+                "OK",
+                "",
+            )
+            persist_membership_events(conn, ticker, snapshot_id, as_of)
+            return {"ticker": ticker, "status": "OK", "row_count": len(holdings), "snapshot_id": snapshot_id}
         else:
             if not source_url:
                 raise ValueError("Source URL is not configured.")
@@ -830,14 +1045,17 @@ def render_dashboard(conn: sqlite3.Connection, config: dict[str, Any]) -> Path:
     output_dir = Path(config.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / config.get("output_file", "us_etf_weight_dashboard.html")
-    all_etfs = config.get("etfs", [])
-    active_etfs = etfs_for_view(all_etfs, "active")
-    every_etf = etfs_for_view(all_etfs, "all")
-    for etf in every_etf:
+    us_etfs = list(config.get("etfs", []))
+    kr_etfs = list(config.get("kr_etfs", []))
+    all_tracked = us_etfs + kr_etfs
+    active_etfs = etfs_for_view(us_etfs, "active")
+    every_etf = etfs_for_view(us_etfs, "all")
+    kr_view_etfs = etfs_for_view(kr_etfs, "kr")
+    for etf in all_tracked:
         current = latest_snapshot(conn, etf["ticker"].upper(), ok_only=True)
         if current:
             persist_membership_events(conn, etf["ticker"].upper(), int(current["id"]), str(current["as_of_date"]))
-    freshest_as_of_date = latest_source_date(conn, every_etf)
+    freshest_as_of_date = latest_source_date(conn, all_tracked)
     latest_run = conn.execute(
         "SELECT * FROM us_etf_runs ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -845,8 +1063,10 @@ def render_dashboard(conn: sqlite3.Connection, config: dict[str, Any]) -> Path:
     if run_id:
         persist_view_aggregate_flows(conn, run_id, "active", active_etfs, freshest_as_of_date)
         persist_view_aggregate_flows(conn, run_id, "all", every_etf, freshest_as_of_date)
+        persist_view_aggregate_flows(conn, run_id, "kr", kr_view_etfs, freshest_as_of_date)
     active_groups = group_etfs(active_etfs)
     all_groups = group_etfs(every_etf)
+    kr_groups = group_etfs(kr_view_etfs)
     view_panels = {
         "active": {
             "label": "Active",
@@ -865,6 +1085,15 @@ def render_dashboard(conn: sqlite3.Connection, config: dict[str, Any]) -> Path:
             "stats": dashboard_stats(conn, every_etf),
             "event_summary": render_view_event_summary(conn, every_etf),
             "flow_summary": render_view_flow_summary(conn, run_id, "all"),
+        },
+        "kr": {
+            "label": "KR",
+            "sections": "\n".join(
+                render_group_section(conn, group_name, rows, freshest_as_of_date) for group_name, rows in kr_groups
+            ),
+            "stats": dashboard_stats(conn, kr_view_etfs),
+            "event_summary": render_view_event_summary(conn, kr_view_etfs),
+            "flow_summary": render_view_flow_summary(conn, run_id, "kr"),
         },
     }
     updated = latest_run["ended_at"] if latest_run and latest_run["ended_at"] else now_kst()
@@ -898,7 +1127,7 @@ def render_group_section(
       <div class="group-head">
         <div>
           <h2>{esc(group_name)}</h2>
-          <p>{len(etfs)} funds · {tracked} active collectors · {exact_count} exact · {proxy_count} proxy</p>
+          <p>{len(etfs)} funds · {tracked} collectors · {exact_count} exact · {proxy_count} proxy</p>
         </div>
       </div>
       <div class="terminal-table">
@@ -1256,50 +1485,62 @@ def build_telegram_summary(
     results: list[dict[str, Any]],
     output_path: Path,
     run_id: int,
-    etfs: list[dict[str, Any]],
+    config: dict[str, Any],
 ) -> str:
     ok_count = sum(1 for item in results if item["status"] == "OK")
     error_count = sum(1 for item in results if item["status"] == "ERROR")
-    active_etfs = etfs_for_view(etfs, "active")
-    all_etfs = etfs_for_view(etfs, "all")
+    us_etfs = list(config.get("etfs", []))
+    kr_etfs = list(config.get("kr_etfs", []))
+    active_etfs = etfs_for_view(us_etfs, "active")
+    all_etfs = etfs_for_view(us_etfs, "all")
+    kr_view_etfs = etfs_for_view(kr_etfs, "kr")
 
     def format_new_entries(view_etfs: list[dict[str, Any]], limit: int = 10) -> str:
         rows = latest_membership_events_for_view(conn, view_etfs, "NEW")[:limit]
         if not rows:
-            return "없음"
+            return "None"
         return ", ".join(f'{row["ticker"]}:{row["holding_ticker"] or row["holding_name"]}' for row in rows)
 
     def format_aggregate(direction: str, view_name: str, limit: int = 10) -> str:
         rows = aggregate_flow_rows(conn, run_id, view_name, direction, limit=limit)
         if not rows:
-            return "없음"
+            return "None"
         return ", ".join(
             f'{row["holding_ticker"] or row["holding_name"]} {fmt_delta(row["total_delta_pct"])} ({int(row["contributor_count"])}ETF)'
             for row in rows
         )
 
     lines = [
-        "US ETF 비중 변동 업데이트",
-        f"수집 결과: OK {ok_count} / ERROR {error_count}",
-        f"대시보드: {output_path}",
+        "ETF holdings update",
+        f"Collection result: OK {ok_count} / ERROR {error_count}",
+        f"Dashboard: {output_path}",
         "",
-        "[Active] 신규 편입 종목",
+        "[Active] New entries",
         format_new_entries(active_etfs, 10),
         "",
-        "[Active] 합산 매수 Top 10",
+        "[Active] Aggregate buys Top 10",
         format_aggregate("BUY", "active", 10),
         "",
-        "[Active] 합산 매도 Top 10",
+        "[Active] Aggregate sells Top 10",
         format_aggregate("SELL", "active", 10),
         "",
-        "[All] 신규 편입 종목",
+        "[All] New entries",
         format_new_entries(all_etfs, 10),
         "",
-        "[All] 합산 매수 Top 10",
+        "[All] Aggregate buys Top 10",
         format_aggregate("BUY", "all", 10),
         "",
-        "[All] 합산 매도 Top 10",
+        "[All] Aggregate sells Top 10",
         format_aggregate("SELL", "all", 10),
+        "",
+        "[KR] New entries",
+        format_new_entries(kr_view_etfs, 10),
+        "",
+        "[KR] Aggregate buys Top 10",
+        format_aggregate("BUY", "kr", 10),
+        "",
+        "[KR] Aggregate sells Top 10",
+        format_aggregate("SELL", "kr", 10),
     ]
     return "\n".join(lines)
 
@@ -1729,7 +1970,7 @@ def build_html(brand: str, updated: str, view_panels: dict[str, dict[str, Any]])
       <div>
         <div class="brand-kicker">EUGENE SECURITIES | AHN SANG HYUN | ACTIVE ETF MORNITOR</div>
         <h1>{esc(brand)}</h1>
-        <p class="hero-subtitle">Bloomberg-style monitor for U.S. ETF holdings changes across Active and All views</p>
+        <p class="hero-subtitle">Bloomberg-style monitor for U.S. ETF holdings changes across Active, All, and KR views</p>
         <div class="view-switch">
           {tab_buttons}
         </div>
@@ -1841,6 +2082,8 @@ def group_etfs(etfs: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any
 
 
 def etfs_for_view(etfs: list[dict[str, Any]], view: str) -> list[dict[str, Any]]:
+    if view == "kr":
+        return list(etfs)
     if view == "all":
         return list(etfs)
     if view == "active":

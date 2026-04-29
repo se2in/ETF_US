@@ -13,6 +13,97 @@
     "chat_id_env": "TELEGRAM_CHAT_USA_ID",
     "send_document": false
   },
+  "krx": {
+    "username_env": "KRX_MARKETDATA_ID",
+    "password_env": "KRX_MARKETDATA_PASSWORD",
+    "cookie_env": "KRX_MARKETDATA_COOKIE",
+    "login_page_url": "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp",
+    "login_post_url": "",
+    "username_field": "loginId",
+    "password_field": "loginPwd",
+    "login_payload": {},
+    "raw_pdf_dir": "data/krx_pdfs"
+  },
+  "kr_etfs": [
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 1,
+      "ticker": "360750",
+      "issuer": "Mirae Asset",
+      "strategy": "US S&P 500",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    },
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 2,
+      "ticker": "133690",
+      "issuer": "Mirae Asset",
+      "strategy": "US Nasdaq 100",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    },
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 3,
+      "ticker": "379800",
+      "issuer": "Samsung Asset Management",
+      "strategy": "US S&P 500 TR",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    },
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 4,
+      "ticker": "379810",
+      "issuer": "Samsung Asset Management",
+      "strategy": "US Nasdaq 100 TR",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    },
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 5,
+      "ticker": "371460",
+      "issuer": "Mirae Asset",
+      "strategy": "China EV thematic",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    },
+    {
+      "group": "KRX Overseas ETF PDF",
+      "rank": 6,
+      "ticker": "283580",
+      "issuer": "Samsung Asset Management",
+      "strategy": "China CSI 300",
+      "feature": "KR-listed overseas ETF via KRX PDF",
+      "data_mode": "exact",
+      "enabled": false,
+      "source_type": "krx_marketdata_pdf",
+      "source_method": "GET",
+      "source_url": ""
+    }
+  ],
 
   "etfs": [
     {
