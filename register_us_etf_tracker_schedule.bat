@@ -39,9 +39,11 @@ echo - %TASK_0940% at 09:40
 echo - %TASK_1500% at 15:00
 echo - %TASK_2200% at 22:00
 echo.
-echo Runner   : %RUNNER%
-echo Log file : %ROOT%output\us_etf_tracker_last_run.log
-echo Dashboard: %ROOT%output\us_etf_weight_dashboard.html
+echo Runner        : %RUNNER%
+echo Log file      : %ROOT%output\us_etf_tracker_last_run.log
+echo Dashboard     : %ROOT%output\us_etf_weight_dashboard.html
+echo GitHub Pages  : %ROOT%docs\index.html
+echo Remote sync   : docs\index.html will be committed and pushed to origin/main when it changes
 echo.
 pause
 endlocal
